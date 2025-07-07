@@ -242,6 +242,21 @@ class HopsworksInstaller:
                     if not self.registry_secrets_created:
                         print_colored("Warning: Azure registry secrets not properly configured", "yellow")
                 
+                # If --internal-loadbalancer flag is set, update LoadBalancer annotations
+                if self.args.internal_loadbalancer:
+                    if self.environment == "AWS":
+                        # Change AWS LoadBalancer to internal
+                        if "externalLoadBalancers" in cloud_config:
+                            cloud_config["externalLoadBalancers"]["annotations"]["service.beta.kubernetes.io/aws-load-balancer-scheme"] = "internal"
+                    elif self.environment == "Azure":
+                        # Change Azure LoadBalancer to internal
+                        cloud_config["hopsworks.service.worker.external.https.annotations.service\\.beta\\.kubernetes\\.io/azure-load-balancer-internal"] = "true"
+                    elif self.environment == "GCP":
+                        # Add GCP internal LoadBalancer annotation
+                        if "externalLoadBalancers" not in cloud_config:
+                            cloud_config["externalLoadBalancers"] = {"enabled": True, "annotations": {}}
+                        cloud_config["externalLoadBalancers"]["annotations"]["networking.gke.io/load-balancer-type"] = "Internal"
+                
                 helm_values.update(cloud_config)
 
             # Flatten nested structures
@@ -1019,6 +1034,7 @@ subjects:
         parser.add_argument('--no-user-data', action='store_true', help='Skip sending user data')
         parser.add_argument('--skip-license', action='store_true', help='Skip license agreement step')
         parser.add_argument('--namespace', default='hopsworks', help='Namespace for Hopsworks installation')
+        parser.add_argument('--internal-loadbalancer', action='store_true', help='Use internal LoadBalancer instead of internet-facing')
         self.args = parser.parse_args()
         self.namespace = self.args.namespace
 
@@ -1224,6 +1240,9 @@ subjects:
         print_colored(f"UI:    https://{address}:28181", "cyan")
         print_colored(f"API:   https://{address}:8182", "cyan")
         print_colored("Login: admin@hopsworks.ai / admin", "cyan")
+        
+        if self.args.internal_loadbalancer:
+            print_colored("\nNote: You're using an internal LoadBalancer. Make sure you can access the VPC/network where the LoadBalancer is deployed.", "yellow")
 
         if health_check(self.namespace):
             print_colored("\nHealth check passed!", "green")
