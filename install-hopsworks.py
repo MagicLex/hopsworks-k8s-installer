@@ -218,6 +218,11 @@ class HopsworksInstaller:
             # Start with base config
             helm_values = HELM_BASE_CONFIG.copy()
             
+            # If --no-loadbalancer flag is set, override service type to NodePort
+            if self.args.no_loadbalancer:
+                helm_values["hopsworks.service.worker.external.https.type"] = "NodePort"
+                helm_values["global._hopsworks.externalLoadBalancers.enabled"] = "false"
+            
             # Add cloud-specific values
             if self.environment in CLOUD_SPECIFIC_VALUES:
                 cloud_config = CLOUD_SPECIFIC_VALUES[self.environment].copy()
@@ -241,6 +246,17 @@ class HopsworksInstaller:
                     # We only need to verify the secret exists, which we track with registry_secrets_created
                     if not self.registry_secrets_created:
                         print_colored("Warning: Azure registry secrets not properly configured", "yellow")
+                
+                # If --no-loadbalancer flag is set, remove LoadBalancer specific configurations
+                if self.args.no_loadbalancer:
+                    # Remove AWS LoadBalancer annotations
+                    if "externalLoadBalancers" in cloud_config:
+                        cloud_config["externalLoadBalancers"]["enabled"] = False
+                    
+                    # Remove Azure LoadBalancer specific configs
+                    if self.environment == "Azure":
+                        cloud_config.pop("hopsworks.service.worker.external.https.type", None)
+                        cloud_config.pop("hopsworks.service.worker.external.https.annotations.service\\.beta\\.kubernetes\\.io/azure-load-balancer-internal", None)
                 
                 helm_values.update(cloud_config)
 
@@ -469,50 +485,53 @@ class HopsworksInstaller:
             print_colored("Failed to create GP3 storage class", "red")
             sys.exit(1)
 
-        # 8. Set up AWS Load Balancer Controller
-        print_colored("\nSetting up AWS Load Balancer Controller...", "cyan")
-        
-        # Download and create ALB policy
-        cmd = "curl -o iam_policy_alb.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.2/docs/install/iam_policy.json"
-        if not run_command(cmd)[0]:
-            print_colored("Failed to download ALB policy", "red")
-            sys.exit(1)
+        # 8. Set up AWS Load Balancer Controller (skip if --no-loadbalancer flag is set)
+        if not self.args.no_loadbalancer:
+            print_colored("\nSetting up AWS Load Balancer Controller...", "cyan")
+            
+            # Download and create ALB policy
+            cmd = "curl -o iam_policy_alb.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.2/docs/install/iam_policy.json"
+            if not run_command(cmd)[0]:
+                print_colored("Failed to download ALB policy", "red")
+                sys.exit(1)
 
-        alb_policy_name = f"AWSLoadBalancerControllerIAMPolicy-{self.cluster_name}-{timestamp}"
-        cmd = f"aws iam create-policy --policy-name {alb_policy_name} --policy-document file://iam_policy_alb.json --profile {self.aws_profile}"
-        run_command(cmd)  # Ignore if policy exists
+            alb_policy_name = f"AWSLoadBalancerControllerIAMPolicy-{self.cluster_name}-{timestamp}"
+            cmd = f"aws iam create-policy --policy-name {alb_policy_name} --policy-document file://iam_policy_alb.json --profile {self.aws_profile}"
+            run_command(cmd)  # Ignore if policy exists
 
-        # Create service account with explicit role
-        print_colored("\nCreating service account for Load Balancer Controller...", "cyan")
-        cmd = (f"eksctl create iamserviceaccount "
-            f"--cluster={self.cluster_name} "
-            f"--namespace=kube-system "
-            f"--name=aws-load-balancer-controller "
-            f"--role-name=AmazonEKSLoadBalancerControllerRole-{self.cluster_name} "
-            f"--attach-policy-arn=arn:aws:iam::{self.aws_account_id}:policy/{alb_policy_name} "
-            f"--override-existing-serviceaccounts "
-            f"--approve "
-            f"--region={self.region}")
+            # Create service account with explicit role
+            print_colored("\nCreating service account for Load Balancer Controller...", "cyan")
+            cmd = (f"eksctl create iamserviceaccount "
+                f"--cluster={self.cluster_name} "
+                f"--namespace=kube-system "
+                f"--name=aws-load-balancer-controller "
+                f"--role-name=AmazonEKSLoadBalancerControllerRole-{self.cluster_name} "
+                f"--attach-policy-arn=arn:aws:iam::{self.aws_account_id}:policy/{alb_policy_name} "
+                f"--override-existing-serviceaccounts "
+                f"--approve "
+                f"--region={self.region}")
 
-        if not run_command(cmd)[0]:
-            print_colored("Failed to create service account for ALB controller", "red")
-            sys.exit(1)
+            if not run_command(cmd)[0]:
+                print_colored("Failed to create service account for ALB controller", "red")
+                sys.exit(1)
 
-        # Install AWS Load Balancer Controller
-        print_colored("\nInstalling AWS Load Balancer Controller...", "cyan")
-        cmd = (f"helm install aws-load-balancer-controller eks/aws-load-balancer-controller "
-            f"-n kube-system "
-            f"--set clusterName={self.cluster_name} "
-            f"--set serviceAccount.create=false "
-            f"--set serviceAccount.name=aws-load-balancer-controller "
-            f"--set region={self.region} "
-            f"--set vpcId=$(aws eks describe-cluster --name {self.cluster_name} --query \"cluster.resourcesVpcConfig.vpcId\" --output text --region {self.region}) "
-            f"--set image.repository=602401143452.dkr.ecr.{self.region}.amazonaws.com/amazon/aws-load-balancer-controller "
-            "--set enableServiceMutatorWebhook=false")
+            # Install AWS Load Balancer Controller
+            print_colored("\nInstalling AWS Load Balancer Controller...", "cyan")
+            cmd = (f"helm install aws-load-balancer-controller eks/aws-load-balancer-controller "
+                f"-n kube-system "
+                f"--set clusterName={self.cluster_name} "
+                f"--set serviceAccount.create=false "
+                f"--set serviceAccount.name=aws-load-balancer-controller "
+                f"--set region={self.region} "
+                f"--set vpcId=$(aws eks describe-cluster --name {self.cluster_name} --query \"cluster.resourcesVpcConfig.vpcId\" --output text --region {self.region}) "
+                f"--set image.repository=602401143452.dkr.ecr.{self.region}.amazonaws.com/amazon/aws-load-balancer-controller "
+                "--set enableServiceMutatorWebhook=false")
 
-        if not run_command(cmd)[0]:
-            print_colored("Failed to install AWS Load Balancer Controller", "red")
-            sys.exit(1)
+            if not run_command(cmd)[0]:
+                print_colored("Failed to install AWS Load Balancer Controller", "red")
+                sys.exit(1)
+        else:
+            print_colored("\nSkipping AWS Load Balancer Controller installation (--no-loadbalancer flag set)", "yellow")
 
         # 9. Install and configure metrics server
         print_colored("\nInstalling metrics server...", "cyan")
@@ -1019,8 +1038,14 @@ subjects:
         parser.add_argument('--no-user-data', action='store_true', help='Skip sending user data')
         parser.add_argument('--skip-license', action='store_true', help='Skip license agreement step')
         parser.add_argument('--namespace', default='hopsworks', help='Namespace for Hopsworks installation')
+        parser.add_argument('--no-loadbalancer', action='store_true', help='Use NodePort instead of LoadBalancer for services')
         self.args = parser.parse_args()
         self.namespace = self.args.namespace
+        
+        # Validate conflicting flags
+        if self.args.loadbalancer_only and self.args.no_loadbalancer:
+            print_colored("Error: --loadbalancer-only and --no-loadbalancer cannot be used together", "red")
+            sys.exit(1)
 
     def get_deployment_environment(self):
         environments = ["AWS", "Azure", "GCP", "OVH"]
@@ -1158,7 +1183,32 @@ subjects:
             status_thread.join()
                                         
     def get_load_balancer_address(self):
-        """Get LoadBalancer address with more robust detection"""
+        """Get LoadBalancer or NodePort address with more robust detection"""
+        # If using NodePort, get node IP and port
+        if self.args.no_loadbalancer:
+            # Get NodePort for HTTPS service
+            cmd = f"kubectl get svc -n {self.namespace} hopsworks-release -o jsonpath='{{.spec.ports[?(@.name==\"https\")].nodePort}}'"
+            success, port_output, _ = run_command(cmd, verbose=False)
+            
+            if success and port_output.strip():
+                node_port = port_output.strip()
+                
+                # Get node IPs
+                cmd = "kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type==\"ExternalIP\")].address}'"
+                success, external_ip, _ = run_command(cmd, verbose=False)
+                
+                if not success or not external_ip.strip():
+                    # Try InternalIP if ExternalIP not available
+                    cmd = "kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type==\"InternalIP\")].address}'"
+                    success, internal_ip, _ = run_command(cmd, verbose=False)
+                    if success and internal_ip.strip():
+                        return f"{internal_ip.strip()}:{node_port}"
+                else:
+                    return f"{external_ip.strip()}:{node_port}"
+            
+            return None
+        
+        # Original LoadBalancer logic
         # Try both hostname and IP - some providers might give either
         commands = [
             "kubectl get svc -n {ns} hopsworks-release -o jsonpath='{{.status.loadBalancer.ingress[0].hostname}}'",
@@ -1200,10 +1250,10 @@ subjects:
         return None
 
     def finalize_installation(self):
-        """Simple installation finalization focused on LoadBalancer"""
+        """Simple installation finalization focused on LoadBalancer or NodePort"""
         print_colored("\nFinalizing installation...", "blue")
         
-        # Give the LoadBalancer some time to get an address
+        # Give the service some time to get an address
         max_retries = 12  # 2 minutes total
         address = None
         
@@ -1212,17 +1262,32 @@ subjects:
             if address:
                 break
             if i < max_retries - 1:  # Don't sleep on last iteration
-                print_colored("Waiting for LoadBalancer address...", "yellow")
+                if self.args.no_loadbalancer:
+                    print_colored("Waiting for NodePort configuration...", "yellow")
+                else:
+                    print_colored("Waiting for LoadBalancer address...", "yellow")
                 time.sleep(10)
         
         if not address:
-            print_colored("Failed to obtain LoadBalancer address. Manual configuration may be needed.", "red")
-            print_colored("Run 'kubectl get svc -n {} hopsworks-release' to check status".format(self.namespace), "yellow")
+            if self.args.no_loadbalancer:
+                print_colored("Failed to obtain NodePort configuration. Manual configuration may be needed.", "red")
+                print_colored("Run 'kubectl get svc -n {} hopsworks-release' to check the NodePort".format(self.namespace), "yellow")
+            else:
+                print_colored("Failed to obtain LoadBalancer address. Manual configuration may be needed.", "red")
+                print_colored("Run 'kubectl get svc -n {} hopsworks-release' to check status".format(self.namespace), "yellow")
             return
 
         print_colored("\nHopsworks is accessible at:", "green")
-        print_colored(f"UI:    https://{address}:28181", "cyan")
-        print_colored(f"API:   https://{address}:8182", "cyan")
+        if self.args.no_loadbalancer:
+            # For NodePort, address already includes port
+            base_address = address.split(':')[0]
+            node_port = address.split(':')[1]
+            print_colored(f"UI:    https://{address}", "cyan")
+            print_colored(f"API:   https://{base_address}:{int(node_port)+1}", "cyan")
+            print_colored("\nNote: You're using NodePort. Make sure your security groups/firewall allows access to these ports.", "yellow")
+        else:
+            print_colored(f"UI:    https://{address}:28181", "cyan")
+            print_colored(f"API:   https://{address}:8182", "cyan")
         print_colored("Login: admin@hopsworks.ai / admin", "cyan")
 
         if health_check(self.namespace):
